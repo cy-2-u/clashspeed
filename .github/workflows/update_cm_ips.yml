@@ -1,9 +1,8 @@
-name: Update CM Preferred IPs (vps789 cfIpApi)
+name: Update CM Preferred IPs (merge builtin + realtime, dedupe)
 
 on:
   schedule:
-    # 每 60 分钟（每小时）执行一次
-    - cron: "0 * * * *"
+    - cron: "0 * * * *" # 每小时整点
   workflow_dispatch: {}
 
 permissions:
@@ -26,37 +25,81 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Fetch CM IPs and write CSV.txt
+      - name: Fetch CM IPs, merge with builtin, dedupe, write CSV.txt
         shell: bash
         run: |
           set -euo pipefail
 
           cat > update_cm_ips.py << 'PY'
           import json
-          import os
+          import re
           import sys
           from datetime import datetime, timezone
-
-          import urllib.request
+          from urllib.request import Request, urlopen
 
           API_URL = "https://vps789.com/openApi/cfIpApi"
           OUTPUT_FILE = "CSV.txt"
           TAG = "#优选"
 
+          # 你提供的“自带IP”列表（固定保留 + 与实时IP去重合并）
+          BUILTIN_LINES = """
+          172.64.159.213#优选
+          104.17.144.235#优选
+          104.17.182.11#优选
+          104.16.158.249#优选
+          172.64.152.111#优选
+          104.17.22.240#优选
+          104.18.95.26#优选
+          104.16.248.48#优选
+          104.16.251.148#优选
+          172.64.145.194#优选
+          108.162.198.198#优选
+          """.strip()
+
+          IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+
+          def is_valid_ipv4(ip: str) -> bool:
+              if not IPV4_RE.match(ip):
+                  return False
+              parts = ip.split(".")
+              return all(0 <= int(p) <= 255 for p in parts)
+
           def http_get_json(url: str) -> dict:
-              req = urllib.request.Request(
+              req = Request(
                   url,
                   headers={
-                      "User-Agent": "github-actions-cm-ip-updater/1.0",
+                      "User-Agent": "github-actions-cm-ip-updater/2.0",
                       "Accept": "application/json",
                   },
                   method="GET",
               )
-              with urllib.request.urlopen(req, timeout=20) as resp:
-                  data = resp.read().decode("utf-8", errors="replace")
-              return json.loads(data)
+              with urlopen(req, timeout=25) as resp:
+                  raw = resp.read().decode("utf-8", errors="replace")
+              return json.loads(raw)
+
+          def parse_builtin_ips(text: str) -> list[str]:
+              ips = []
+              for line in text.splitlines():
+                  line = line.strip()
+                  if not line:
+                      continue
+                  # 支持 “IP#优选” 或 “IP #优选” 等
+                  ip = line.split("#", 1)[0].strip()
+                  if is_valid_ipv4(ip):
+                      ips.append(ip)
+              # 保持原顺序去重
+              seen = set()
+              out = []
+              for ip in ips:
+                  if ip in seen:
+                      continue
+                  seen.add(ip)
+                  out.append(ip)
+              return out
 
           def main():
+              builtin_ips = parse_builtin_ips(BUILTIN_LINES)
+
               try:
                   payload = http_get_json(API_URL)
               except Exception as e:
@@ -69,12 +112,11 @@ jobs:
 
               data = payload.get("data") or {}
               cm_list = data.get("CM") or []
-
-              if not isinstance(cm_list, list) or len(cm_list) == 0:
-                  print("ERROR: CM list is empty or invalid.", file=sys.stderr)
+              if not isinstance(cm_list, list) or not cm_list:
+                  print("ERROR: CM list is empty/invalid.", file=sys.stderr)
                   sys.exit(1)
 
-              # 规则：按 avgScore 从小到大（越小越好），再按 ydLatencyAvg 从小到大兜底
+              # 先把实时CM按“移动优选”排序：avgScore（越小越好）→ ydLatencyAvg → ydPkgLostRateAvg
               def key_fn(x):
                   return (
                       x.get("avgScore", 10**9),
@@ -84,34 +126,44 @@ jobs:
 
               cm_sorted = sorted(cm_list, key=key_fn)
 
-              # 去重（保持排序）
-              seen = set()
-              ips = []
+              # 提取实时IP（按排序后的顺序），去重
+              realtime_ips = []
+              seen_rt = set()
               for item in cm_sorted:
                   ip = (item or {}).get("ip")
                   if not ip or not isinstance(ip, str):
                       continue
+                  ip = ip.strip()
+                  if not is_valid_ipv4(ip):
+                      continue
+                  if ip in seen_rt:
+                      continue
+                  seen_rt.add(ip)
+                  realtime_ips.append(ip)
+
+              # 合并逻辑（你要求：检查实时IP与自带IP是否重复，重复删掉，只保留一个）
+              # 这里采用：最终输出顺序 = 先自带（保持你给的顺序） + 再追加实时里“非重复”的
+              builtin_set = set(builtin_ips)
+              merged_ips = list(builtin_ips) + [ip for ip in realtime_ips if ip not in builtin_set]
+
+              # 最终再做一次全局去重（保险）
+              final = []
+              seen = set()
+              for ip in merged_ips:
                   if ip in seen:
                       continue
                   seen.add(ip)
-                  ips.append(ip)
+                  final.append(ip)
 
-              if not ips:
-                  print("ERROR: no valid IPs extracted.", file=sys.stderr)
-                  sys.exit(1)
-
-              lines = [f"{ip}{TAG}" for ip in ips]
-              content = "\n".join(lines) + "\n"
-
-              # 覆盖写入 / 不存在则创建
+              # 输出格式：每行 "ip#优选"
+              content = "\n".join(f"{ip}{TAG}" for ip in final) + "\n"
               with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
                   f.write(content)
 
-              # 打印一点日志
               now = datetime.now(timezone.utc).isoformat()
-              print(f"[{now}] Wrote {len(ips)} IPs to {OUTPUT_FILE}")
-              print("Top 5:")
-              for ip in ips[:5]:
+              print(f"[{now}] builtin={len(builtin_ips)} realtime={len(realtime_ips)} final={len(final)} -> {OUTPUT_FILE}")
+              print("Top 10 output:")
+              for ip in final[:10]:
                   print(" -", ip)
 
           if __name__ == "__main__":
@@ -128,7 +180,7 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add CSV.txt
-            git commit -m "chore: update CM preferred IPs"
+            git commit -m "chore: update CM preferred IPs (merge & dedupe)"
             git push
           else
             echo "No changes to commit."
