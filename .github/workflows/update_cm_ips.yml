@@ -1,4 +1,4 @@
-name: Update CM Preferred IPs (merge builtin + realtime, dedupe)
+name: Update CM Preferred IPs (merge builtin + realtime, dedupe, SSL fallback)
 
 on:
   schedule:
@@ -33,7 +33,9 @@ jobs:
           cat > update_cm_ips.py << 'PY'
           import json
           import re
+          import ssl
           import sys
+          import urllib.error
           from datetime import datetime, timezone
           from urllib.request import Request, urlopen
 
@@ -62,20 +64,10 @@ jobs:
               if not IPV4_RE.match(ip):
                   return False
               parts = ip.split(".")
-              return all(0 <= int(p) <= 255 for p in parts)
-
-          def http_get_json(url: str) -> dict:
-              req = Request(
-                  url,
-                  headers={
-                      "User-Agent": "github-actions-cm-ip-updater/2.0",
-                      "Accept": "application/json",
-                  },
-                  method="GET",
-              )
-              with urlopen(req, timeout=25) as resp:
-                  raw = resp.read().decode("utf-8", errors="replace")
-              return json.loads(raw)
+              try:
+                  return all(0 <= int(p) <= 255 for p in parts)
+              except ValueError:
+                  return False
 
           def parse_builtin_ips(text: str) -> list[str]:
               ips = []
@@ -83,7 +75,6 @@ jobs:
                   line = line.strip()
                   if not line:
                       continue
-                  # 支持 “IP#优选” 或 “IP #优选” 等
                   ip = line.split("#", 1)[0].strip()
                   if is_valid_ipv4(ip):
                       ips.append(ip)
@@ -97,11 +88,49 @@ jobs:
                   out.append(ip)
               return out
 
+          def http_get_json_with_ssl_fallback(url: str) -> dict:
+              """
+              1) 先正常校验证书请求
+              2) 如果遇到 CERTIFICATE_VERIFY_FAILED，则自动使用不验证证书重试一次
+                 （证书恢复后会自动回到正常验证）
+              """
+              req = Request(
+                  url,
+                  headers={
+                      "User-Agent": "github-actions-cm-ip-updater/3.0",
+                      "Accept": "application/json",
+                  },
+                  method="GET",
+              )
+
+              # 先用默认（验证证书）
+              try:
+                  with urlopen(req, timeout=25) as resp:
+                      raw = resp.read().decode("utf-8", errors="replace")
+                  return json.loads(raw)
+              except urllib.error.URLError as e:
+                  # 判断是否是证书校验失败
+                  reason = getattr(e, "reason", None)
+                  msg = str(reason) if reason is not None else str(e)
+
+                  if "CERTIFICATE_VERIFY_FAILED" not in msg:
+                      raise  # 不是证书问题，直接抛出
+
+                  # 证书问题：降级为不验证证书重试
+                  print("WARN: SSL certificate verify failed; retrying with certificate verification DISABLED.", file=sys.stderr)
+                  insecure_ctx = ssl.create_default_context()
+                  insecure_ctx.check_hostname = False
+                  insecure_ctx.verify_mode = ssl.CERT_NONE
+
+                  with urlopen(req, timeout=25, context=insecure_ctx) as resp:
+                      raw = resp.read().decode("utf-8", errors="replace")
+                  return json.loads(raw)
+
           def main():
               builtin_ips = parse_builtin_ips(BUILTIN_LINES)
 
               try:
-                  payload = http_get_json(API_URL)
+                  payload = http_get_json_with_ssl_fallback(API_URL)
               except Exception as e:
                   print(f"ERROR: failed to fetch API: {e}", file=sys.stderr)
                   sys.exit(1)
@@ -116,7 +145,7 @@ jobs:
                   print("ERROR: CM list is empty/invalid.", file=sys.stderr)
                   sys.exit(1)
 
-              # 先把实时CM按“移动优选”排序：avgScore（越小越好）→ ydLatencyAvg → ydPkgLostRateAvg
+              # 排序：avgScore（越小越好）→ ydLatencyAvg → ydPkgLostRateAvg
               def key_fn(x):
                   return (
                       x.get("avgScore", 10**9),
@@ -141,12 +170,15 @@ jobs:
                   seen_rt.add(ip)
                   realtime_ips.append(ip)
 
-              # 合并逻辑（你要求：检查实时IP与自带IP是否重复，重复删掉，只保留一个）
-              # 这里采用：最终输出顺序 = 先自带（保持你给的顺序） + 再追加实时里“非重复”的
+              if not realtime_ips:
+                  print("ERROR: no valid realtime IPs extracted.", file=sys.stderr)
+                  sys.exit(1)
+
+              # 合并逻辑：先自带（保持顺序） + 再追加实时里非重复的
               builtin_set = set(builtin_ips)
               merged_ips = list(builtin_ips) + [ip for ip in realtime_ips if ip not in builtin_set]
 
-              # 最终再做一次全局去重（保险）
+              # 全局再去重一次（保险）
               final = []
               seen = set()
               for ip in merged_ips:
@@ -157,6 +189,8 @@ jobs:
 
               # 输出格式：每行 "ip#优选"
               content = "\n".join(f"{ip}{TAG}" for ip in final) + "\n"
+
+              # 覆盖写入 / 不存在则创建
               with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
                   f.write(content)
 
