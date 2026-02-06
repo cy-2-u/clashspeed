@@ -2,7 +2,7 @@ name: 朝阳的IP
 
 on:
   schedule:
-    - cron: "0 * * * *" # 每小时整点运行
+    - cron: "0 * * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -15,7 +15,7 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
 
     steps:
       - name: Checkout
@@ -28,29 +28,24 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Generate CSV.txt (merge + dedupe + exclude result.csv) with SSL Bypass
+      - name: Generate IPs and Log
         shell: bash
         run: |
           set -euo pipefail
-
+          
           cat > chaoyang_ip.py << 'PY'
-          import json
-          import os
-          import re
-          import sys
-          import time
-          import ssl  # <--- 新增：引入 ssl 模块
-          from datetime import datetime, timezone
+          import json, os, re, sys, time, ssl
+          from datetime import datetime, timezone, timedelta
           from urllib.request import Request, urlopen
           from urllib.error import URLError, HTTPError
 
-          API_URL = "https://vps789.com/openApi/cfIpApi"
-          OUTPUT_FILE = "CSV.txt"
-          EXCLUDE_FILE = "result.csv"
+          API = "https://vps789.com/openApi/cfIpApi"
+          OUT = "CSV.txt"
+          EXC = "result.csv"
+          LOG = "ip_log.txt"
           TAG = "#优选"
-
-          # 你提供的“自带IP”
-          BUILTIN_LINES = """
+          
+          BUILTIN = """
           172.64.159.213#优选
           104.17.144.235#优选
           104.17.182.11#优选
@@ -64,182 +59,111 @@ jobs:
           108.162.198.198#优选
           """.strip()
 
-          IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+          IPV4 = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
 
-          def is_valid_ipv4(ip: str) -> bool:
-              if not IPV4_RE.match(ip):
-                  return False
-              parts = ip.split(".")
-              try:
-                  return all(0 <= int(p) <= 255 for p in parts)
-              except ValueError:
-                  return False
+          def check_ip(ip):
+              if not IPV4.match(ip): return False
+              try: return all(0<=int(p)<=255 for p in ip.split("."))
+              except: return False
 
-          def extract_ips_from_text(text: str) -> list[str]:
+          def get_ips(text):
+              res = []
               seen = set()
-              out = []
               for line in text.splitlines():
-                  line = line.strip()
-                  if not line:
-                      continue
-                  ip = line.split("#", 1)[0].strip()
-                  if not is_valid_ipv4(ip):
-                      continue
-                  if ip in seen:
-                      continue
-                  seen.add(ip)
-                  out.append(ip)
-              return out
+                  s = line.strip()
+                  if not s: continue
+                  ip = s.split("#")[0].strip()
+                  if check_ip(ip) and ip not in seen:
+                      seen.add(ip)
+                      res.append(ip)
+              return res
 
-          def read_exclude_ips(path: str) -> set[str]:
-              if not os.path.exists(path):
-                  return set()
+          def get_exc():
+              if not os.path.exists(EXC): return set()
               try:
-                  with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                      txt = f.read()
-              except Exception:
-                  return set()
-              return set(extract_ips_from_text(txt))
+                  with open(EXC, "r", encoding="utf-8", errors="ignore") as f:
+                      return set(get_ips(f.read()))
+              except: return set()
 
-          def http_get_json_with_retry(url: str, retries: int = 4, base_sleep: float = 1.0) -> dict:
-              """带重试的GET JSON，已增加忽略SSL证书验证。"""
+          def fetch_api():
+              ctx = ssl.create_default_context()
+              ctx.check_hostname = False
+              ctx.verify_mode = ssl.CERT_NONE
               
-              # <--- 修改开始：创建忽略证书验证的 SSL 上下文 --->
-              ssl_context = ssl.create_default_context()
-              ssl_context.check_hostname = False
-              ssl_context.verify_mode = ssl.CERT_NONE
-              # <--- 修改结束 --->
-
-              last_err = None
-              for attempt in range(1, retries + 1):
+              for i in range(4):
                   try:
-                      req = Request(
-                          url,
-                          headers={
-                              "User-Agent": "github-actions-chaoyang-ip/3.0",
-                              "Accept": "application/json",
-                              "Cache-Control": "no-cache",
-                              "Pragma": "no-cache",
-                          },
-                          method="GET",
-                      )
-                      # <--- 修改：在此处传入 context=ssl_context --->
-                      with urlopen(req, timeout=25, context=ssl_context) as resp:
-                          raw = resp.read().decode("utf-8", errors="replace")
-                      return json.loads(raw)
-                  except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as e:
-                      last_err = e
-                      sleep_s = base_sleep * (2 ** (attempt - 1))
-                      print(f"WARN: fetch failed (attempt {attempt}/{retries}): {e}; sleep {sleep_s:.1f}s", file=sys.stderr)
-                      time.sleep(sleep_s)
-                  except Exception as e:
-                      last_err = e
-                      print(f"WARN: unexpected error (attempt {attempt}/{retries}): {e}", file=sys.stderr)
-                      time.sleep(base_sleep * (2 ** (attempt - 1)))
-              raise RuntimeError(f"API fetch failed after {retries} retries: {last_err}")
-
-          def sort_cm_list(cm_list: list[dict]) -> list[dict]:
-              def key_fn(x: dict):
-                  return (
-                      x.get("avgScore", 10**9),
-                      x.get("ydLatencyAvg", 10**9),
-                      x.get("ydPkgLostRateAvg", 10**9),
-                  )
-              return sorted(cm_list, key=key_fn)
-
-          def merge_preserve_order(primary: list[str], secondary: list[str]) -> list[str]:
-              seen = set()
-              out = []
-              for ip in primary:
-                  if ip not in seen:
-                      seen.add(ip)
-                      out.append(ip)
-              for ip in secondary:
-                  if ip not in seen:
-                      seen.add(ip)
-                      out.append(ip)
-              return out
+                      req = Request(API, headers={"User-Agent":"gh-action"}, method="GET")
+                      with urlopen(req, timeout=20, context=ctx) as r:
+                          d = json.loads(r.read().decode("utf-8"))
+                      if d.get("code")!=0: continue
+                      
+                      cm = d.get("data", {}).get("CM", [])
+                      cm.sort(key=lambda x: (x.get("avgScore", 9e9), x.get("ydLatencyAvg", 9e9)))
+                      
+                      ips = []
+                      seen = set()
+                      for item in cm:
+                          ip = str(item.get("ip","")).strip()
+                          if check_ip(ip) and ip not in seen:
+                              seen.add(ip)
+                              ips.append(ip)
+                      return ips
+                  except:
+                      time.sleep(1.5 * (2**i))
+              return []
 
           def main():
-              builtin_ips = extract_ips_from_text(BUILTIN_LINES)
-              exclude_ips = read_exclude_ips(EXCLUDE_FILE)
-
-              realtime_ips: list[str] = []
-              api_ok = False
-              api_err = None
-
-              try:
-                  payload = http_get_json_with_retry(API_URL)
-                  if payload.get("code") != 0:
-                      raise RuntimeError(f"API non-zero code: {payload.get('code')} message={payload.get('message')}")
-                  data = payload.get("data") or {}
-                  cm_list = data.get("CM") or []
-                  if not isinstance(cm_list, list) or not cm_list:
-                      raise RuntimeError("CM list empty/invalid in API response")
-
-                  cm_sorted = sort_cm_list(cm_list)
-
-                  seen_rt = set()
-                  for item in cm_sorted:
-                      ip = (item or {}).get("ip")
-                      if not ip or not isinstance(ip, str):
-                          continue
-                      ip = ip.strip()
-                      if not is_valid_ipv4(ip):
-                          continue
-                      if ip in seen_rt:
-                          continue
-                      seen_rt.add(ip)
-                      realtime_ips.append(ip)
-
-                  if not realtime_ips:
-                      raise RuntimeError("No valid realtime IPs extracted from CM list")
-
-                  api_ok = True
-
-              except Exception as e:
-                  api_err = str(e)
-                  print(f"ERROR: API problem: {api_err}", file=sys.stderr)
-                  realtime_ips = []
-
-              merged = merge_preserve_order(builtin_ips, realtime_ips)
-              final = [ip for ip in merged if ip not in exclude_ips]
-
-              if not final:
-                  content = ""
-              else:
-                  content = "\n".join(f"{ip}{TAG}" for ip in final) + "\n"
-
-              with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-                  f.write(content)
-
-              now = datetime.now(timezone.utc).isoformat()
-              print(f"[{now}] wrote {len(final)} IPs to {OUTPUT_FILE}")
-              print(f"builtin={len(builtin_ips)} realtime={len(realtime_ips)} exclude={len(exclude_ips)} api_ok={api_ok}")
-              if not api_ok:
-                  print(f"api_error={api_err}", file=sys.stderr)
-
-              for ip in final[:10]:
-                  print(" -", ip)
+              b_ips = get_ips(BUILTIN)
+              exc_set = get_exc()
+              api_ips = fetch_api()
+              
+              seen = set(b_ips)
+              final = list(b_ips)
+              
+              dups = []
+              
+              for ip in api_ips:
+                  if ip in seen:
+                      dups.append(ip)
+                  else:
+                      seen.add(ip)
+                      final.append(ip)
+              
+              final = [ip for ip in final if ip not in exc_set]
+              
+              with open(OUT, "w", encoding="utf-8") as f:
+                  f.write("\n".join(f"{x}{TAG}" for x in final) + "\n" if final else "")
+              
+              cn_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+              
+              log_msg = [
+                  f"[{cn_time}] Run Summary",
+                  f"API IPs Found ({len(api_ips)}): {', '.join(api_ips) if api_ips else 'None'}",
+                  f"Duplicates Removed ({len(dups)}): {', '.join(dups) if dups else 'None'}",
+                  "-"*60 + "\n"
+              ]
+              
+              with open(LOG, "a", encoding="utf-8") as f:
+                  f.write("\n".join(log_msg))
 
           if __name__ == "__main__":
               main()
           PY
-
+          
           python chaoyang_ip.py
 
-      - name: Commit & Push (if changed)
+      - name: Commit & Push
         shell: bash
         run: |
           set -euo pipefail
-
-          if git status --porcelain | grep -qE '^\s*M\s+CSV\.txt|^\?\?\s+CSV\.txt'; then
+          
+          # 同时检查 CSV.txt 和 ip_log.txt 的变化
+          if git status --porcelain | grep -qE 'CSV\.txt|ip_log\.txt'; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-
-            git add CSV.txt
-            git commit -m "chore: update CSV.txt (CM realtime, dedupe, exclude result.csv)"
+            git add CSV.txt ip_log.txt
+            git commit -m "update: IPs & log [skip ci]"
             git push
           else
-            echo "No changes to commit."
+            echo "No changes."
           fi
