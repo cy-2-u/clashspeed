@@ -28,7 +28,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Generate CSV.txt (merge + dedupe + exclude result.csv)
+      - name: Generate CSV.txt (merge + dedupe + exclude result.csv) with SSL Bypass
         shell: bash
         run: |
           set -euo pipefail
@@ -39,16 +39,17 @@ jobs:
           import re
           import sys
           import time
+          import ssl  # <--- 新增：引入 ssl 模块
           from datetime import datetime, timezone
           from urllib.request import Request, urlopen
           from urllib.error import URLError, HTTPError
 
           API_URL = "https://vps789.com/openApi/cfIpApi"
           OUTPUT_FILE = "CSV.txt"
-          EXCLUDE_FILE = "result.csv"  # 仓库内的“自选”文件
+          EXCLUDE_FILE = "result.csv"
           TAG = "#优选"
 
-          # 你提供的“自带IP”（固定保留 + 与实时CM去重合并）
+          # 你提供的“自带IP”
           BUILTIN_LINES = """
           172.64.159.213#优选
           104.17.144.235#优选
@@ -75,7 +76,6 @@ jobs:
                   return False
 
           def extract_ips_from_text(text: str) -> list[str]:
-              """从文本中提取每行的 IPv4（允许存在 #标签），保持原顺序去重。"""
               seen = set()
               out = []
               for line in text.splitlines():
@@ -92,7 +92,6 @@ jobs:
               return out
 
           def read_exclude_ips(path: str) -> set[str]:
-              """读取 result.csv 的 IP（不存在则返回空集合）。"""
               if not os.path.exists(path):
                   return set()
               try:
@@ -103,7 +102,14 @@ jobs:
               return set(extract_ips_from_text(txt))
 
           def http_get_json_with_retry(url: str, retries: int = 4, base_sleep: float = 1.0) -> dict:
-              """带重试的GET JSON，处理临时网络错误/偶发超时。"""
+              """带重试的GET JSON，已增加忽略SSL证书验证。"""
+              
+              # <--- 修改开始：创建忽略证书验证的 SSL 上下文 --->
+              ssl_context = ssl.create_default_context()
+              ssl_context.check_hostname = False
+              ssl_context.verify_mode = ssl.CERT_NONE
+              # <--- 修改结束 --->
+
               last_err = None
               for attempt in range(1, retries + 1):
                   try:
@@ -117,12 +123,12 @@ jobs:
                           },
                           method="GET",
                       )
-                      with urlopen(req, timeout=25) as resp:
+                      # <--- 修改：在此处传入 context=ssl_context --->
+                      with urlopen(req, timeout=25, context=ssl_context) as resp:
                           raw = resp.read().decode("utf-8", errors="replace")
                       return json.loads(raw)
                   except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as e:
                       last_err = e
-                      # 指数退避
                       sleep_s = base_sleep * (2 ** (attempt - 1))
                       print(f"WARN: fetch failed (attempt {attempt}/{retries}): {e}; sleep {sleep_s:.1f}s", file=sys.stderr)
                       time.sleep(sleep_s)
@@ -133,7 +139,6 @@ jobs:
               raise RuntimeError(f"API fetch failed after {retries} retries: {last_err}")
 
           def sort_cm_list(cm_list: list[dict]) -> list[dict]:
-              """按移动优选排序：avgScore（小优）→ ydLatencyAvg → ydPkgLostRateAvg，缺失值排后。"""
               def key_fn(x: dict):
                   return (
                       x.get("avgScore", 10**9),
@@ -143,7 +148,6 @@ jobs:
               return sorted(cm_list, key=key_fn)
 
           def merge_preserve_order(primary: list[str], secondary: list[str]) -> list[str]:
-              """合并两列表，保序去重（primary优先）。"""
               seen = set()
               out = []
               for ip in primary:
@@ -160,7 +164,6 @@ jobs:
               builtin_ips = extract_ips_from_text(BUILTIN_LINES)
               exclude_ips = read_exclude_ips(EXCLUDE_FILE)
 
-              # 先准备实时IP（失败也要尽量生成一个“可用结果”）
               realtime_ips: list[str] = []
               api_ok = False
               api_err = None
@@ -197,22 +200,16 @@ jobs:
               except Exception as e:
                   api_err = str(e)
                   print(f"ERROR: API problem: {api_err}", file=sys.stderr)
-                  # 降级：只用 builtin（但仍会排除 result.csv 的IP）
                   realtime_ips = []
 
-              # 合并：先自带（你的顺序）+ 再实时（按分数排序）
               merged = merge_preserve_order(builtin_ips, realtime_ips)
-
-              # 关键：排除 result.csv 里的 IP（CSV.txt 不允许出现）
               final = [ip for ip in merged if ip not in exclude_ips]
 
-              # 如果 final 为空，作为极端保护：至少写入注释（避免生成空文件导致下游崩）
               if not final:
                   content = ""
               else:
                   content = "\n".join(f"{ip}{TAG}" for ip in final) + "\n"
 
-              # 覆盖写入 / 不存在则创建
               with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
                   f.write(content)
 
@@ -222,7 +219,6 @@ jobs:
               if not api_ok:
                   print(f"api_error={api_err}", file=sys.stderr)
 
-              # 打印前10便于排查
               for ip in final[:10]:
                   print(" -", ip)
 
@@ -237,7 +233,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 如果没有变化就不提交
           if git status --porcelain | grep -qE '^\s*M\s+CSV\.txt|^\?\?\s+CSV\.txt'; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
