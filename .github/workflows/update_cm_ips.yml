@@ -1,49 +1,54 @@
-name: Update CM Preferred IPs (merge builtin + realtime, dedupe, SSL fallback)
+name: 朝阳的IP
 
 on:
   schedule:
-    - cron: "0 * * * *" # 每小时整点
+    - cron: "0 * * * *" # 每小时整点运行
   workflow_dispatch: {}
 
 permissions:
   contents: write
 
 concurrency:
-  group: update-cm-ips
+  group: chaoyang-ip
   cancel-in-progress: true
 
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Fetch CM IPs, merge with builtin, dedupe, write CSV.txt
+      - name: Generate CSV.txt (merge + dedupe + exclude result.csv)
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > update_cm_ips.py << 'PY'
+          cat > chaoyang_ip.py << 'PY'
           import json
+          import os
           import re
-          import ssl
           import sys
-          import urllib.error
+          import time
           from datetime import datetime, timezone
           from urllib.request import Request, urlopen
+          from urllib.error import URLError, HTTPError
 
           API_URL = "https://vps789.com/openApi/cfIpApi"
           OUTPUT_FILE = "CSV.txt"
+          EXCLUDE_FILE = "result.csv"  # 仓库内的“自选”文件
           TAG = "#优选"
 
-          # 你提供的“自带IP”列表（固定保留 + 与实时IP去重合并）
+          # 你提供的“自带IP”（固定保留 + 与实时CM去重合并）
           BUILTIN_LINES = """
           172.64.159.213#优选
           104.17.144.235#优选
@@ -69,134 +74,155 @@ jobs:
               except ValueError:
                   return False
 
-          def parse_builtin_ips(text: str) -> list[str]:
-              ips = []
+          def extract_ips_from_text(text: str) -> list[str]:
+              """从文本中提取每行的 IPv4（允许存在 #标签），保持原顺序去重。"""
+              seen = set()
+              out = []
               for line in text.splitlines():
                   line = line.strip()
                   if not line:
                       continue
                   ip = line.split("#", 1)[0].strip()
-                  if is_valid_ipv4(ip):
-                      ips.append(ip)
-              # 保持原顺序去重
-              seen = set()
-              out = []
-              for ip in ips:
+                  if not is_valid_ipv4(ip):
+                      continue
                   if ip in seen:
                       continue
                   seen.add(ip)
                   out.append(ip)
               return out
 
-          def http_get_json_with_ssl_fallback(url: str) -> dict:
-              """
-              1) 先正常校验证书请求
-              2) 如果遇到 CERTIFICATE_VERIFY_FAILED，则自动使用不验证证书重试一次
-                 （证书恢复后会自动回到正常验证）
-              """
-              req = Request(
-                  url,
-                  headers={
-                      "User-Agent": "github-actions-cm-ip-updater/3.0",
-                      "Accept": "application/json",
-                  },
-                  method="GET",
-              )
-
-              # 先用默认（验证证书）
+          def read_exclude_ips(path: str) -> set[str]:
+              """读取 result.csv 的 IP（不存在则返回空集合）。"""
+              if not os.path.exists(path):
+                  return set()
               try:
-                  with urlopen(req, timeout=25) as resp:
-                      raw = resp.read().decode("utf-8", errors="replace")
-                  return json.loads(raw)
-              except urllib.error.URLError as e:
-                  # 判断是否是证书校验失败
-                  reason = getattr(e, "reason", None)
-                  msg = str(reason) if reason is not None else str(e)
+                  with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                      txt = f.read()
+              except Exception:
+                  return set()
+              return set(extract_ips_from_text(txt))
 
-                  if "CERTIFICATE_VERIFY_FAILED" not in msg:
-                      raise  # 不是证书问题，直接抛出
+          def http_get_json_with_retry(url: str, retries: int = 4, base_sleep: float = 1.0) -> dict:
+              """带重试的GET JSON，处理临时网络错误/偶发超时。"""
+              last_err = None
+              for attempt in range(1, retries + 1):
+                  try:
+                      req = Request(
+                          url,
+                          headers={
+                              "User-Agent": "github-actions-chaoyang-ip/3.0",
+                              "Accept": "application/json",
+                              "Cache-Control": "no-cache",
+                              "Pragma": "no-cache",
+                          },
+                          method="GET",
+                      )
+                      with urlopen(req, timeout=25) as resp:
+                          raw = resp.read().decode("utf-8", errors="replace")
+                      return json.loads(raw)
+                  except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as e:
+                      last_err = e
+                      # 指数退避
+                      sleep_s = base_sleep * (2 ** (attempt - 1))
+                      print(f"WARN: fetch failed (attempt {attempt}/{retries}): {e}; sleep {sleep_s:.1f}s", file=sys.stderr)
+                      time.sleep(sleep_s)
+                  except Exception as e:
+                      last_err = e
+                      print(f"WARN: unexpected error (attempt {attempt}/{retries}): {e}", file=sys.stderr)
+                      time.sleep(base_sleep * (2 ** (attempt - 1)))
+              raise RuntimeError(f"API fetch failed after {retries} retries: {last_err}")
 
-                  # 证书问题：降级为不验证证书重试
-                  print("WARN: SSL certificate verify failed; retrying with certificate verification DISABLED.", file=sys.stderr)
-                  insecure_ctx = ssl.create_default_context()
-                  insecure_ctx.check_hostname = False
-                  insecure_ctx.verify_mode = ssl.CERT_NONE
-
-                  with urlopen(req, timeout=25, context=insecure_ctx) as resp:
-                      raw = resp.read().decode("utf-8", errors="replace")
-                  return json.loads(raw)
-
-          def main():
-              builtin_ips = parse_builtin_ips(BUILTIN_LINES)
-
-              try:
-                  payload = http_get_json_with_ssl_fallback(API_URL)
-              except Exception as e:
-                  print(f"ERROR: failed to fetch API: {e}", file=sys.stderr)
-                  sys.exit(1)
-
-              if payload.get("code") != 0:
-                  print(f"ERROR: API returned non-zero code: {payload}", file=sys.stderr)
-                  sys.exit(1)
-
-              data = payload.get("data") or {}
-              cm_list = data.get("CM") or []
-              if not isinstance(cm_list, list) or not cm_list:
-                  print("ERROR: CM list is empty/invalid.", file=sys.stderr)
-                  sys.exit(1)
-
-              # 排序：avgScore（越小越好）→ ydLatencyAvg → ydPkgLostRateAvg
-              def key_fn(x):
+          def sort_cm_list(cm_list: list[dict]) -> list[dict]:
+              """按移动优选排序：avgScore（小优）→ ydLatencyAvg → ydPkgLostRateAvg，缺失值排后。"""
+              def key_fn(x: dict):
                   return (
                       x.get("avgScore", 10**9),
                       x.get("ydLatencyAvg", 10**9),
                       x.get("ydPkgLostRateAvg", 10**9),
                   )
+              return sorted(cm_list, key=key_fn)
 
-              cm_sorted = sorted(cm_list, key=key_fn)
-
-              # 提取实时IP（按排序后的顺序），去重
-              realtime_ips = []
-              seen_rt = set()
-              for item in cm_sorted:
-                  ip = (item or {}).get("ip")
-                  if not ip or not isinstance(ip, str):
-                      continue
-                  ip = ip.strip()
-                  if not is_valid_ipv4(ip):
-                      continue
-                  if ip in seen_rt:
-                      continue
-                  seen_rt.add(ip)
-                  realtime_ips.append(ip)
-
-              if not realtime_ips:
-                  print("ERROR: no valid realtime IPs extracted.", file=sys.stderr)
-                  sys.exit(1)
-
-              # 合并逻辑：先自带（保持顺序） + 再追加实时里非重复的
-              builtin_set = set(builtin_ips)
-              merged_ips = list(builtin_ips) + [ip for ip in realtime_ips if ip not in builtin_set]
-
-              # 全局再去重一次（保险）
-              final = []
+          def merge_preserve_order(primary: list[str], secondary: list[str]) -> list[str]:
+              """合并两列表，保序去重（primary优先）。"""
               seen = set()
-              for ip in merged_ips:
-                  if ip in seen:
-                      continue
-                  seen.add(ip)
-                  final.append(ip)
+              out = []
+              for ip in primary:
+                  if ip not in seen:
+                      seen.add(ip)
+                      out.append(ip)
+              for ip in secondary:
+                  if ip not in seen:
+                      seen.add(ip)
+                      out.append(ip)
+              return out
 
-              # 输出格式：每行 "ip#优选"
-              content = "\n".join(f"{ip}{TAG}" for ip in final) + "\n"
+          def main():
+              builtin_ips = extract_ips_from_text(BUILTIN_LINES)
+              exclude_ips = read_exclude_ips(EXCLUDE_FILE)
+
+              # 先准备实时IP（失败也要尽量生成一个“可用结果”）
+              realtime_ips: list[str] = []
+              api_ok = False
+              api_err = None
+
+              try:
+                  payload = http_get_json_with_retry(API_URL)
+                  if payload.get("code") != 0:
+                      raise RuntimeError(f"API non-zero code: {payload.get('code')} message={payload.get('message')}")
+                  data = payload.get("data") or {}
+                  cm_list = data.get("CM") or []
+                  if not isinstance(cm_list, list) or not cm_list:
+                      raise RuntimeError("CM list empty/invalid in API response")
+
+                  cm_sorted = sort_cm_list(cm_list)
+
+                  seen_rt = set()
+                  for item in cm_sorted:
+                      ip = (item or {}).get("ip")
+                      if not ip or not isinstance(ip, str):
+                          continue
+                      ip = ip.strip()
+                      if not is_valid_ipv4(ip):
+                          continue
+                      if ip in seen_rt:
+                          continue
+                      seen_rt.add(ip)
+                      realtime_ips.append(ip)
+
+                  if not realtime_ips:
+                      raise RuntimeError("No valid realtime IPs extracted from CM list")
+
+                  api_ok = True
+
+              except Exception as e:
+                  api_err = str(e)
+                  print(f"ERROR: API problem: {api_err}", file=sys.stderr)
+                  # 降级：只用 builtin（但仍会排除 result.csv 的IP）
+                  realtime_ips = []
+
+              # 合并：先自带（你的顺序）+ 再实时（按分数排序）
+              merged = merge_preserve_order(builtin_ips, realtime_ips)
+
+              # 关键：排除 result.csv 里的 IP（CSV.txt 不允许出现）
+              final = [ip for ip in merged if ip not in exclude_ips]
+
+              # 如果 final 为空，作为极端保护：至少写入注释（避免生成空文件导致下游崩）
+              if not final:
+                  content = ""
+              else:
+                  content = "\n".join(f"{ip}{TAG}" for ip in final) + "\n"
 
               # 覆盖写入 / 不存在则创建
               with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
                   f.write(content)
 
               now = datetime.now(timezone.utc).isoformat()
-              print(f"[{now}] builtin={len(builtin_ips)} realtime={len(realtime_ips)} final={len(final)} -> {OUTPUT_FILE}")
-              print("Top 10 output:")
+              print(f"[{now}] wrote {len(final)} IPs to {OUTPUT_FILE}")
+              print(f"builtin={len(builtin_ips)} realtime={len(realtime_ips)} exclude={len(exclude_ips)} api_ok={api_ok}")
+              if not api_ok:
+                  print(f"api_error={api_err}", file=sys.stderr)
+
+              # 打印前10便于排查
               for ip in final[:10]:
                   print(" -", ip)
 
@@ -204,17 +230,20 @@ jobs:
               main()
           PY
 
-          python update_cm_ips.py
+          python chaoyang_ip.py
 
       - name: Commit & Push (if changed)
         shell: bash
         run: |
           set -euo pipefail
+
+          # 如果没有变化就不提交
           if git status --porcelain | grep -qE '^\s*M\s+CSV\.txt|^\?\?\s+CSV\.txt'; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
+
             git add CSV.txt
-            git commit -m "chore: update CM preferred IPs (merge & dedupe)"
+            git commit -m "chore: update CSV.txt (CM realtime, dedupe, exclude result.csv)"
             git push
           else
             echo "No changes to commit."
