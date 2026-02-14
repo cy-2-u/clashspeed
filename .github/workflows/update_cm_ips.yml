@@ -1,173 +1,33 @@
-name: 朝阳的IP
+name: Sync IPs from Nutstore
 
 on:
-  schedule:
-    - cron: "0 * * * *"
-  workflow_dispatch: {}
-
-permissions:
-  contents: write
-
-concurrency:
-  group: chaoyang-ip
-  cancel-in-progress: true
+  # 允许手动触发或通过 API 触发
+  workflow_dispatch:
 
 jobs:
-  update:
+  update-file:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Generate IPs and Log
-        shell: bash
+      - name: Download result.txt from Nutstore
         run: |
-          set -euo pipefail
-          
-          cat > chaoyang_ip.py << 'PY'
-          import json, os, re, sys, time, ssl
-          from datetime import datetime, timezone, timedelta
-          from urllib.request import Request, urlopen
-          
-          # 配置
-          API_URL = "https://vps789.com/openApi/cfIpApi"
-          OUT_FILE = "CSV.txt"
-          EXC_FILE = "result.csv"
-          LOG_FILE = "ip_log.txt"
-          TAG = "#优选"
-          
-          # 自带IP
-          BUILTIN_STR = """
-          172.64.159.213#优选
-          104.17.144.235#优选
-          104.17.182.11#优选
-          104.16.158.249#优选
-          172.64.152.111#优选
-          104.17.22.240#优选
-          104.18.95.26#优选
-          104.16.248.48#优选
-          104.16.251.148#优选
-          172.64.145.194#优选
-          108.162.198.198#优选
-          """.strip()
+          # 使用 WebDAV 直接下载原始文件，比抓取网页更稳定
+          curl -u "2671174616@qq.com:anfk8qdcdjibsvmk" \
+               -o youxuan.txt \
+               "https://dav.jianguoyun.com/dav/ScriptCat/result.txt"
 
-          def get_ips(text):
-              res = []
-              seen = set()
-              for line in text.splitlines():
-                  s = line.split("#")[0].strip()
-                  if re.match(r"^(?:\d{1,3}\.){3}\d{1,3}$", s) and s not in seen:
-                      seen.add(s)
-                      res.append(s)
-              return res
-
-          def fetch_api_ips():
-              ctx = ssl.create_default_context()
-              ctx.check_hostname = False
-              ctx.verify_mode = ssl.CERT_NONE
-              
-              for i in range(3):
-                  try:
-                      req = Request(API_URL, headers={"User-Agent":"gh-action"}, method="GET")
-                      with urlopen(req, timeout=15, context=ctx) as r:
-                          data = json.loads(r.read().decode("utf-8"))
-                      
-                      if data.get("code") != 0: continue
-                      
-                      # 提取CM列表并按质量排序 (avgScore越小越好)
-                      cm_list = data.get("data", {}).get("CM", [])
-                      cm_list.sort(key=lambda x: (x.get("avgScore", 9999), x.get("ydLatencyAvg", 9999)))
-                      
-                      ips = []
-                      seen = set()
-                      for item in cm_list:
-                          ip = str(item.get("ip", "")).strip()
-                          if re.match(r"^(?:\d{1,3}\.){3}\d{1,3}$", ip) and ip not in seen:
-                              seen.add(ip)
-                              ips.append(ip)
-                      return ips
-                  except Exception:
-                      time.sleep(1)
-              return []
-
-          def main():
-              # 1. 准备基础数据
-              builtin_ips = get_ips(BUILTIN_STR)
-              api_ips = fetch_api_ips()
-              
-              exc_set = set()
-              if os.path.exists(EXC_FILE):
-                  try:
-                      with open(EXC_FILE, "r", encoding="utf-8", errors="ignore") as f:
-                          exc_set = set(get_ips(f.read()))
-                  except: pass
-
-              # 2. 对比去重逻辑
-              # 以自带IP为基准，检查API获取的IP是否重复
-              builtin_set = set(builtin_ips)
-              duplicates = []
-              unique_api = []
-              
-              for ip in api_ips:
-                  if ip in builtin_set:
-                      duplicates.append(ip)
-                  else:
-                      unique_api.append(ip)
-                      builtin_set.add(ip) # 防止API内部也有重复
-              
-              # 3. 合并列表 (自带 + API去重后的)
-              merged = builtin_ips + unique_api
-              
-              # 4. 排除 result.csv 中的IP
-              final = [ip for ip in merged if ip not in exc_set]
-              
-              # 5. 生成 CSV.txt
-              content = "\n".join(f"{ip}{TAG}" for ip in final) + "\n" if final else ""
-              with open(OUT_FILE, "w", encoding="utf-8") as f:
-                  f.write(content)
-                  
-              # 6. 生成日志 (覆盖模式)
-              cn_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
-              
-              log_text = [
-                  f"Time (CN): {cn_time}",
-                  f"Total API IPs Fetched: {len(api_ips)}",
-                  f"API IPs List: {', '.join(api_ips) if api_ips else 'None'}",
-                  f"Duplicates Removed (exists in builtin): {len(duplicates)}",
-                  f"Duplicate IPs List: {', '.join(duplicates) if duplicates else 'None'}",
-                  f"Total Final IPs: {len(final)}"
-              ]
-              
-              with open(LOG_FILE, "w", encoding="utf-8") as f:
-                  f.write("\n".join(log_text))
-
-          if __name__ == "__main__":
-              main()
-          PY
-          
-          python chaoyang_ip.py
-
-      - name: Commit & Push
-        shell: bash
+      - name: Commit and Push
         run: |
-          set -euo pipefail
+          git config --global user.name "GitHub Action"
+          git config --global user.email "actions@github.com"
           
-          # 只有当文件有实质变化时才提交
-          if git status --porcelain | grep -qE 'CSV\.txt|ip_log\.txt'; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add CSV.txt ip_log.txt
-            git commit -m "update: IPs and Log [skip ci]"
-            git push
+          # 检查文件是否有变化
+          if git diff --quiet youxuan.txt; then
+            echo "数据未变化，跳过更新。"
           else
-            echo "No changes."
+            git add youxuan.txt
+            git commit -m "自动更新优选IP: $(date +'%Y-%m-%d %H:%M:%S')"
+            git push
           fi
