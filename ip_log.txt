@@ -1,6 +1,6 @@
-Time (CN): 2026-02-14 07:20:00
+Time (CN): 2026-02-14 09:02:00
 Total API IPs Fetched: 5
-API IPs List: 162.159.44.39, 172.64.53.60, 172.64.158.18, 162.159.45.128, 104.16.248.183
+API IPs List: 162.159.38.212, 162.159.60.117, 162.159.44.39, 104.16.150.155, 104.16.248.183
 Duplicates Removed (exists in builtin): 0
 Duplicate IPs List: None
 Total Final IPs: 16
