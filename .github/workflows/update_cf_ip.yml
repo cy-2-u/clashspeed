@@ -1,0 +1,67 @@
+name: Update Best CF IPs
+
+on:
+  schedule:
+    # 每天每小时的第 0 分钟运行一次
+    - cron: '0 * * * *'
+  workflow_dispatch: # 允许你在 Actions 页面手动点击运行，方便测试
+
+jobs:
+  update-ips:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 必须赋予写入权限，以便将更新后的文件推送到仓库
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch API and Process IPs
+        run: |
+          # 1. 请求 API
+          # -k / --insecure : 跳过 SSL 证书验证，防止因证书过期报错
+          # -s : 静默模式
+          # --retry 3 : 遇到错误（如超时）最多重试 3 次
+          # --retry-delay 5 : 每次重试间隔 5 秒
+          # -o temp_api_result.json : 将结果输出到临时文件
+          curl -k -s --retry 3 --retry-delay 5 "https://vps789.com/openApi/cfIpApi" -o temp_api_result.json
+          
+          # 检查 API 是否成功返回有效数据（简单检查是否存在 "data" 字段）
+          if ! grep -q '"data"' temp_api_result.json; then
+            echo "API request failed or invalid response. Printing response:"
+            cat temp_api_result.json
+            exit 1
+          fi
+
+          # 2. 解析 JSON 并提取 IP
+          # jq -r '.data[] | .[] | .ip' 获取 data 下所有数组内的 ip
+          # grep -Ev '^$|null' 去除空行或 null 的无效值
+          # sort -u 进行去重操作
+          # awk '{print $1"#优选"}' 给每个 IP 加上指定的后缀
+          # > bestcfip 会在文件存在时覆盖，在文件不存在时自动新建
+          jq -r '.data[] | .[] | .ip' temp_api_result.json | grep -Ev '^$|null' | sort -u | awk '{print $1"#优选"}' > bestcfip
+
+          # 打印一下结果，方便在 Actions 日志中查看
+          echo "Extracted IPs:"
+          cat bestcfip
+
+          # 3. 清理临时文件
+          rm temp_api_result.json
+
+      - name: Commit and Push changes
+        run: |
+          # 配置 GitHub Actions 机器人的 Git 信息
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 将生成的 bestcfip 加入暂存区
+          git add bestcfip
+          
+          # 检查 bestcfip 是否有实质性的变动，只有当文件发生改变时才执行 commit 和 push 操作
+          if ! git diff --staged --quiet; then
+            git commit -m "Auto-update bestcfip: $(date +'%Y-%m-%d %H:%M:%S')"
+            git push
+            echo "Successfully pushed updated bestcfip."
+          else
+            echo "No changes in IPs detected. Skipping push."
+          fi
