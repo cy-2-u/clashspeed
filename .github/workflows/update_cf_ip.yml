@@ -4,13 +4,13 @@ on:
   schedule:
     # 每天每小时的第 0 分钟运行一次
     - cron: '0 * * * *'
-  workflow_dispatch: # 允许你在 Actions 页面手动点击运行，方便测试
+  workflow_dispatch: # 允许手动触发运行
 
 jobs:
   update-ips:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 必须赋予写入权限，以便将更新后的文件推送到仓库
+      contents: write # 必须赋予写入权限
 
     steps:
       - name: Checkout repository
@@ -18,50 +18,73 @@ jobs:
 
       - name: Fetch API and Process IPs
         run: |
+          # 定义所有使用到的文件的绝对路径
+          WORKSPACE="$GITHUB_WORKSPACE"
+          API_RESULT="$WORKSPACE/temp_api_result.json"
+          HEIMD_FILE="$WORKSPACE/heimd"
+          BLACKLIST="$WORKSPACE/temp_blacklist.txt"
+          RAW_IPS="$WORKSPACE/temp_raw_ips.txt"
+          FILTERED_IPS="$WORKSPACE/temp_filtered_ips.txt"
+          BEST_IP_FILE="$WORKSPACE/bestcfip"
+
           # 1. 请求 API
-          # -k / --insecure : 跳过 SSL 证书验证，防止因证书过期报错
-          # -s : 静默模式
-          # --retry 3 : 遇到错误（如超时）最多重试 3 次
-          # --retry-delay 5 : 每次重试间隔 5 秒
-          # -o temp_api_result.json : 将结果输出到临时文件
-          curl -k -s --retry 3 --retry-delay 5 "https://vps789.com/openApi/cfIpApi" -o temp_api_result.json
+          # -k: 跳过证书验证  -s: 静默模式  --retry 3: 失败重试3次
+          curl -k -s --retry 3 --retry-delay 5 "https://vps789.com/openApi/cfIpApi" -o "$API_RESULT"
           
-          # 检查 API 是否成功返回有效数据（简单检查是否存在 "data" 字段）
-          if ! grep -q '"data"' temp_api_result.json; then
-            echo "API request failed or invalid response. Printing response:"
-            cat temp_api_result.json
+          if ! grep -q '"data"' "$API_RESULT"; then
+            echo "API request failed or invalid response."
+            cat "$API_RESULT"
             exit 1
           fi
 
-          # 2. 解析 JSON 并提取 IP
-          # jq -r '.data[] | .[] | .ip' 获取 data 下所有数组内的 ip
-          # grep -Ev '^$|null' 去除空行或 null 的无效值
-          # sort -u 进行去重操作
-          # awk '{print $1"#优选"}' 给每个 IP 加上指定的后缀
-          # > bestcfip 会在文件存在时覆盖，在文件不存在时自动新建
-          jq -r '.data[] | .[] | .ip' temp_api_result.json | grep -Ev '^$|null' | sort -u | awk '{print $1"#优选"}' > bestcfip
+          # 2. 处理黑名单文件 heimd
+          # 如果 heimd 文件不存在，则自动创建一个，并写入提示信息
+          if [ ! -f "$HEIMD_FILE" ]; then
+            echo "# 请在此文件下方添加需要拉黑的IP，每行一个" > "$HEIMD_FILE"
+            echo "Created heimd file at $HEIMD_FILE"
+          fi
 
-          # 打印一下结果，方便在 Actions 日志中查看
-          echo "Extracted IPs:"
-          cat bestcfip
+          # 提取黑名单中有效的 IPv4 地址，防止空行或注释干扰匹配 (|| true 防止为空时报错退出)
+          grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' "$HEIMD_FILE" > "$BLACKLIST" || true
 
-          # 3. 清理临时文件
-          rm temp_api_result.json
+          # 3. 解析 JSON 并提取 API 返回的所有 IP，去重
+          jq -r '.data[] | .[] | .ip' "$API_RESULT" | grep -Ev '^$|null' | sort -u > "$RAW_IPS"
+
+          # 4. 过滤黑名单
+          # -s 检查黑名单文件是否有内容，如果有，则使用 grep -v 剔除黑名单里的 IP
+          if [ -s "$BLACKLIST" ]; then
+            # -v: 反向匹配  -F: 按字符串匹配  -x: 匹配整行  -f: 从文件读取目标
+            grep -v -F -x -f "$BLACKLIST" "$RAW_IPS" > "$FILTERED_IPS" || true
+          else
+            # 如果黑名单为空，直接复制
+            cat "$RAW_IPS" > "$FILTERED_IPS"
+          fi
+
+          # 5. 格式化并覆盖写入 bestcfip 文件
+          awk '{print $1"#优选"}' "$FILTERED_IPS" > "$BEST_IP_FILE"
+
+          echo "Final Extracted IPs:"
+          cat "$BEST_IP_FILE"
+
+          # 6. 清理临时文件
+          rm "$API_RESULT" "$BLACKLIST" "$RAW_IPS" "$FILTERED_IPS"
 
       - name: Commit and Push changes
         run: |
+          WORKSPACE="$GITHUB_WORKSPACE"
+          
           # 配置 GitHub Actions 机器人的 Git 信息
           git config --local user.name "github-actions[bot]"
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           
-          # 将生成的 bestcfip 加入暂存区
-          git add bestcfip
+          # 将生成/更新的 bestcfip 和 heimd 文件加入暂存区
+          git add "$WORKSPACE/bestcfip" "$WORKSPACE/heimd"
           
-          # 检查 bestcfip 是否有实质性的变动，只有当文件发生改变时才执行 commit 和 push 操作
+          # 检查暂存区是否有实质性的变动
           if ! git diff --staged --quiet; then
-            git commit -m "Auto-update bestcfip: $(date +'%Y-%m-%d %H:%M:%S')"
+            git commit -m "Auto-update bestcfip & heimd: $(date +'%Y-%m-%d %H:%M:%S')"
             git push
-            echo "Successfully pushed updated bestcfip."
+            echo "Successfully pushed updated files."
           else
-            echo "No changes in IPs detected. Skipping push."
+            echo "No changes detected. Skipping push."
           fi
